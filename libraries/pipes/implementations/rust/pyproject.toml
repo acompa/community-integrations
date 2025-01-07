@@ -1,11 +1,10 @@
 [project]
-name = "dagster-pipes-java"
+name = "dagster-pipes-rust"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "dagster-aws>=0.25.0",
     "dagster>=1.8.9",
 ]
 
@@ -19,7 +18,7 @@ dev-dependencies = [
 ]
 
 [tool.uv.sources]
-dagster-pipes-tests = { path = "../../../tests/dagster-pipes-tests", editable = true }
+dagster-pipes-tests = { path = "../../tests/dagster-pipes-tests", editable = true }
 
 [tool.pytest.ini_options]
 addopts = "-s "

@@ -1,45 +1,34 @@
 mod context_loader;
 mod params_loader;
-pub mod types;
+mod types;
 mod types_ext;
 mod writer;
 
 use std::collections::HashMap;
 
-use serde::Serialize;
 use serde_json::json;
 use serde_json::Map;
 use serde_json::Value;
 use thiserror::Error;
+use types::PipesException;
 
-use crate::context_loader::DefaultLoader as PipesDefaultContextLoader;
+use crate::context_loader::{DefaultLoader as PipesDefaultContextLoader, PayloadErrorKind};
+use crate::params_loader::{EnvVarLoader as PipesEnvVarParamsLoader, ParamsError};
+use crate::types::{Method, PipesContextData, PipesMessage};
+use crate::writer::message_writer::{
+    get_opened_payload, DefaultWriter as PipesDefaultMessageWriter,
+};
+use crate::writer::message_writer_channel::MessageWriteError;
+
 pub use crate::context_loader::LoadContext;
-use crate::context_loader::PayloadErrorKind;
-use crate::params_loader::EnvVarLoader as PipesEnvVarParamsLoader;
-pub use crate::params_loader::LoadParams;
-use crate::params_loader::ParamsError;
-pub use crate::types::{Method, PipesContextData, PipesMessage, PipesMetadataValue};
-use crate::writer::message_writer::get_opened_payload;
-use crate::writer::message_writer::DefaultWriter as PipesDefaultMessageWriter;
+pub use crate::params_loader::{
+    LoadParams, DAGSTER_PIPES_CONTEXT_ENV_VAR, DAGSTER_PIPES_MESSAGES_ENV_VAR,
+};
+pub use crate::types::{AssetCheckSeverity, PipesMetadataValue};
 pub use crate::writer::message_writer::{DefaultWriter, MessageWriter};
-pub use crate::writer::message_writer_channel::{DefaultChannel, FileChannel};
-use crate::writer::message_writer_channel::{MessageWriteError, MessageWriterChannel};
+pub use crate::writer::message_writer_channel::MessageWriterChannel;
 
-#[derive(Serialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum AssetCheckSeverity {
-    Warn,
-    Error,
-}
-
-impl PipesMetadataValue {
-    pub fn new(raw_value: types::RawValue, pipes_metadata_value_type: types::Type) -> Self {
-        Self {
-            raw_value: Some(raw_value),
-            pipes_metadata_value_type: Some(pipes_metadata_value_type),
-        }
-    }
-}
+const DAGSTER_PIPES_VERSION: &str = "0.1";
 
 // partial translation of
 // https://github.com/dagster-io/dagster/blob/258d9ca0db/python_modules/dagster-pipes/dagster_pipes/__init__.py#L859-L871
@@ -48,7 +37,7 @@ pub struct PipesContext<W>
 where
     W: MessageWriter,
 {
-    data: PipesContextData,
+    pub data: PipesContextData,
     message_channel: W::Channel,
 }
 
@@ -63,11 +52,7 @@ where
     ) -> Result<Self, MessageWriteError> {
         let mut message_channel = message_writer.open(message_params);
         let opened_payload = get_opened_payload(message_writer);
-        let opened_message = PipesMessage {
-            dagster_pipes_version: "0.1".to_string(), // TODO: Convert to `const`
-            method: Method::Opened,
-            params: Some(opened_payload),
-        };
+        let opened_message = PipesMessage::new(Method::Opened, Some(opened_payload));
         message_channel.write_message(opened_message)?;
 
         Ok(Self {
@@ -76,15 +61,30 @@ where
         })
     }
 
+    pub fn close(&mut self, exc: Option<PipesException>) -> Result<(), MessageWriteError> {
+        let params = exc.map(|e| {
+            HashMap::from([
+                ("cause", e.cause.map(|c| json!(c))),
+                ("context", e.context.map(|c| json!(c))),
+                ("message", e.message.map(|m| json!(m))),
+                ("name", e.name.map(|n| json!(n))),
+                ("stack", e.stack.map(|s| json!(s))),
+            ])
+        });
+        let closed_message = PipesMessage::new(Method::Closed, params);
+        self.message_channel.write_message(closed_message)
+    }
+
     pub fn report_asset_materialization(
         &mut self,
         asset_key: &str,
         metadata: HashMap<&str, PipesMetadataValue>,
+        data_version: Option<&str>,
     ) -> Result<(), MessageWriteError> {
         let params: HashMap<&str, Option<serde_json::Value>> = HashMap::from([
             ("asset_key", Some(json!(asset_key))),
             ("metadata", Some(json!(metadata))),
-            ("data_version", None), // TODO - support data versions
+            ("data_version", data_version.map(|version| json!(version))),
         ]);
 
         let msg = PipesMessage::new(Method::ReportAssetMaterialization, Some(params));
@@ -109,6 +109,15 @@ where
 
         let msg = PipesMessage::new(Method::ReportAssetCheck, Some(params));
         self.message_channel.write_message(msg)
+    }
+}
+
+impl<W> Drop for PipesContext<W>
+where
+    W: MessageWriter,
+{
+    fn drop(&mut self) {
+        let _ = self.close(None);
     }
 }
 
@@ -147,114 +156,56 @@ pub fn open_dagster_pipes() -> Result<PipesContext<PipesDefaultMessageWriter>, D
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::NamedTempFile;
+    use writer::message_writer_channel::{DefaultChannel, FileChannel};
 
     use super::*;
 
     #[test]
     fn test_write_pipes_metadata() {
         let asset_metadata = HashMap::from([
-            (
-                "text",
-                PipesMetadataValue::new(
-                    types::RawValue::String("hello".to_string()),
-                    types::Type::Text,
-                ),
-            ),
+            ("int", PipesMetadataValue::from(100)),
+            ("float", PipesMetadataValue::from(100.0)),
+            ("bool", PipesMetadataValue::from(true)),
+            ("none", PipesMetadataValue::null()),
+            ("timestamp", PipesMetadataValue::from_timestamp(1000.0)),
+            ("text", PipesMetadataValue::from("hello".to_string())),
             (
                 "url",
-                PipesMetadataValue::new(
-                    types::RawValue::String("http://someurl.com".to_string()),
-                    types::Type::Url,
-                ),
+                PipesMetadataValue::from_url("http://someurl.com".to_string()),
             ),
             (
                 "path",
-                PipesMetadataValue::new(
-                    types::RawValue::String("file://some/path".to_string()),
-                    types::Type::Path,
-                ),
+                PipesMetadataValue::from_path("file://some/path".to_string()),
             ),
             (
                 "notebook",
-                PipesMetadataValue::new(
-                    types::RawValue::String("notebook".to_string()),
-                    types::Type::Notebook,
-                ),
+                PipesMetadataValue::from_notebook("notebook".to_string()),
             ),
             (
                 "json_object",
-                PipesMetadataValue::new(
-                    types::RawValue::AnythingMap(HashMap::from([(
-                        "key".to_string(),
-                        Some(json!("value")),
-                    )])),
-                    types::Type::Json,
-                ),
+                PipesMetadataValue::from(HashMap::from([(
+                    "key".to_string(),
+                    Some(json!("value")),
+                )])),
             ),
             (
                 "json_array",
-                PipesMetadataValue::new(
-                    types::RawValue::AnythingArray(vec![Some(json!({"key": "value"}))]),
-                    types::Type::Json,
-                ),
+                PipesMetadataValue::from(vec![Some(json!({"key": "value"}))]),
             ),
-            (
-                "md",
-                PipesMetadataValue::new(
-                    types::RawValue::String("## markdown".to_string()),
-                    types::Type::Md,
-                ),
-            ),
+            ("md", PipesMetadataValue::from_md("## markdown".to_string())),
             (
                 "dagster_run",
-                PipesMetadataValue::new(
-                    types::RawValue::String("1234".to_string()),
-                    types::Type::DagsterRun,
-                ),
+                PipesMetadataValue::from_dagster_run("1234".to_string()),
             ),
             (
                 "asset",
-                PipesMetadataValue::new(
-                    types::RawValue::String("some_asset".to_string()),
-                    types::Type::Asset,
-                ),
+                PipesMetadataValue::from_asset("some_asset".to_string()),
             ),
-            (
-                "job",
-                PipesMetadataValue::new(
-                    types::RawValue::String("some_job".to_string()),
-                    types::Type::Job,
-                ),
-            ),
-            (
-                "timestamp",
-                PipesMetadataValue::new(
-                    types::RawValue::String("2012-04-23T18:25:43.511Z".to_string()),
-                    types::Type::Timestamp,
-                ),
-            ),
-            (
-                "int",
-                PipesMetadataValue::new(types::RawValue::Integer(100), types::Type::Int),
-            ),
-            (
-                "float",
-                PipesMetadataValue::new(types::RawValue::Double(100.0), types::Type::Float),
-            ),
-            (
-                "bool",
-                PipesMetadataValue::new(types::RawValue::Bool(true), types::Type::Bool),
-            ),
-            (
-                "none",
-                PipesMetadataValue {
-                    raw_value: None,
-                    pipes_metadata_value_type: None,
-                },
-            ),
+            ("job", PipesMetadataValue::from_job("some_job".to_string())),
         ]);
 
         let file = NamedTempFile::new().unwrap();
@@ -267,20 +218,39 @@ mod tests {
             },
         };
         context
-            .report_asset_materialization("asset1", asset_metadata)
+            .report_asset_materialization("asset1", asset_metadata, Some("v1"))
             .expect("Failed to report asset materialization");
 
         assert_eq!(
             serde_json::from_str::<PipesMessage>(&fs::read_to_string(file.path()).unwrap())
                 .unwrap(),
-            PipesMessage {
-                dagster_pipes_version: "0.1".to_string(),
-                method: Method::ReportAssetMaterialization,
-                params: Some(HashMap::from([
-                    ("asset_key".to_string(), Some(json!("asset1"))),
+            PipesMessage::new(
+                Method::ReportAssetMaterialization,
+                Some(HashMap::from([
+                    ("asset_key", Some(json!("asset1"))),
                     (
-                        "metadata".to_string(),
+                        "metadata",
                         Some(json!({
+                            "int": {
+                                "raw_value": 100,
+                                "type": "int"
+                            },
+                            "float": {
+                                "raw_value": 100.0,
+                                "type": "float"
+                            },
+                            "bool": {
+                                "raw_value": true,
+                                "type": "bool"
+                            },
+                            "none": {
+                                "raw_value": null,
+                                "type": "null"
+                            },
+                            "timestamp": {
+                                "raw_value": 1000.0,
+                                "type": "timestamp"
+                            },
                             "text": {
                                 "raw_value": "hello",
                                 "type": "text"
@@ -320,32 +290,86 @@ mod tests {
                             "job": {
                                 "raw_value": "some_job",
                                 "type": "job"
-                            },
-                            "timestamp": {
-                                "raw_value": "2012-04-23T18:25:43.511Z",
-                                "type": "timestamp"
-                            },
-                            "int": {
-                                "raw_value": 100,
-                                "type": "int"
-                            },
-                            "float": {
-                                "raw_value": 100.0,
-                                "type": "float"
-                            },
-                            "bool": {
-                                "raw_value": true,
-                                "type": "bool"
-                            },
-                            "none": {
-                                "raw_value": null,
-                                "type": null
                             }
                         }))
                     ),
-                    ("data_version".to_string(), None),
+                    ("data_version", Some(json!("v1"))),
                 ])),
-            }
+            )
+        );
+    }
+
+    #[rstest]
+    #[case(
+        Some(PipesException {
+            cause: Box::new(None),
+            context: Box::new(None),
+            message: Some("error".to_string()),
+            name: Some("Error".to_string()),
+            stack: Some(vec!["line1".to_string(), "line2".to_string()]),
+        }),
+        json!({
+            "__dagster_pipes_version": "0.1",
+            "method": "closed",
+            "params": {
+                "cause": null,
+                "context": null,
+                "message": "error",
+                "name": "Error",
+                "stack": ["line1", "line2"]
+            },
+        })
+    )]
+    #[case(
+        None,
+        json!({
+            "__dagster_pipes_version": "0.1",
+            "method": "closed",
+            "params": null,
+        })
+    )]
+    fn test_close_pipes_context(
+        #[case] exc: Option<PipesException>,
+        #[case] expected_message: serde_json::Value,
+    ) {
+        let file = NamedTempFile::new().unwrap();
+        let mut context: PipesContext<DefaultWriter> = PipesContext {
+            message_channel: DefaultChannel::File(FileChannel::new(file.path().into())),
+            data: PipesContextData {
+                asset_keys: Some(vec!["asset1".to_string()]),
+                run_id: "012345".to_string(),
+                ..Default::default()
+            },
+        };
+        context.close(exc).expect("Failed to close context");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(file.path()).unwrap())
+                .unwrap(),
+            expected_message
+        );
+    }
+
+    #[test]
+    fn test_close_pipes_context_when_out_of_scope() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let _: PipesContext<DefaultWriter> = PipesContext {
+                message_channel: DefaultChannel::File(FileChannel::new(file.path().into())),
+                data: PipesContextData {
+                    asset_keys: Some(vec!["asset1".to_string()]),
+                    run_id: "012345".to_string(),
+                    ..Default::default()
+                },
+            };
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(file.path()).unwrap())
+                .unwrap(),
+            json!({
+                "__dagster_pipes_version": "0.1",
+                "method": "closed",
+                "params": null,
+            })
         );
     }
 }
